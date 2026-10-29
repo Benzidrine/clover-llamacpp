@@ -1,0 +1,271 @@
+From b1897173ca68cc74e4ce3228cdcf04d471053d66 Mon Sep 17 00:00:00 2001
+From: VitreousCut <VitreousCut@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:33:36 +0800
+Subject: [PATCH 3/4] diffusion: commit the prompt and preview whole blocks for
+ block-diffusion models
+
+The block schedule re-fed every position of the sequence on every denoising step:
+the prompt was absorbed into the first block, completed blocks were never committed,
+and the whole cache was cleared each step. A block-diffusion model therefore saw
+mask tokens where its committed prefix should be, and produced fluent but unrelated
+text (a fabricated <|im_start|>user turn).
+
+Follow the reference sampler instead:
+
+  * commit the whole prompt through the causal path;
+  * preview each block of exactly block_length mask tokens at the positions that
+    continue after the prefix, on a scratch sequence copied from the committed one.
+    A scratch sequence is needed because the Gated-DeltaNet recurrent state supports
+    a full reset only, and the cache rejects re-running positions it already holds;
+  * after the block resolves, replay it through the causal path and copy the scratch
+    sequence back, so the next block starts from a correct state;
+  * resolve every pending slot whose confidence clears a threshold, falling back to
+    the single most confident one, instead of transferring a fixed count per step.
+    This is what lets a 32-slot block converge in ~10 passes instead of 32;
+  * never sample the mask token;
+  * give the step callback and the timing summary a budget consistent with the block
+    schedule, since block_length passes per block no longer relate to params.steps
+    and the progress bar overran its buffer once there were enough blocks.
+
+blocks and steps_per_block now derive from (max_length - n_input), so a request also
+stops leaving the prompt tail inside block 0.
+---
+ examples/diffusion/diffusion.cpp | 146 ++++++++++++++++++++++++-------
+ 1 file changed, 116 insertions(+), 30 deletions(-)
+
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 0ff57d9..ae4461b 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -157,67 +157,117 @@ void diffusion_generate(llama_context *          ctx,
+         un_x_buffer.resize(params.max_length);
+     }
+ 
+-    // For block-based processing
++    // Clover's block schedule follows the reference sampler: the prompt is committed
++    // causally first, then each block of block_length mask tokens is previewed at positions
++    // continuing after it. The preview graph derives width = n_seq_tokens and feeds it to
++    // log(width/32) and the block-local convolutions, so a previewed block must be exactly
++    // block_length wide - an unaligned batch divides by zero (SIGFPE).
++    const bool block_based = params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED;
++
+     std::vector<int32_t> num_transfer_tokens;
+     int32_t              num_blocks      = 1;
+     int32_t              steps_per_block = params.steps;
+ 
+-    if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
++    if (block_based) {
+         GGML_ASSERT(params.max_length % params.block_length == 0);
+-        num_blocks = params.max_length / params.block_length;
+-        GGML_ASSERT(params.steps % num_blocks == 0);
+-        steps_per_block = params.steps / num_blocks;
++        GGML_ASSERT(n_input <= params.max_length);
++        num_blocks      = (params.max_length - n_input) / params.block_length;
++        GGML_ASSERT(num_blocks > 0);
++        // The reference denoiser iterates at most block_length times per block, independent
++        // of how many blocks the request needs. Scaling by params.steps/num_blocks would
++        // starve long generations of passes and leave masks unresolved.
++        steps_per_block = params.block_length;
+     }
+ 
++    // Step budget actually handed to the progress callback and the timing summary. In block
++    // mode params.steps no longer bounds the work, and reporting it would overrun the
++    // progress bar's buffer once the block count exceeds steps/block_length.
++    const int32_t total_steps = block_based ? num_blocks * steps_per_block : params.steps;
++
+     std::vector<float> confidence(params.max_length);
+ 
+     int64_t total_sampling_time = 0;
+     int64_t total_time          = 0;
+     int64_t time_start          = ggml_time_us();
+ 
++    // seq 0 = committed prefix (grows one block at a time); seq 1 = scratch used to preview a
++    // block against that prefix. The recurrent state cannot be partially erased, and the
++    // cache rejects re-running positions it already holds, so each step previews on a fresh
++    // copy of seq 0 and throws it away.
++    const llama_seq_id scratch_seq = 1;
++    llama_memory_t     mem         = llama_get_memory(ctx);
++
++    if (block_based) {
++        llama_set_causal_attn(ctx, true);
++        llama_memory_seq_rm(mem, 0, -1, -1);
++        batch.clear();
++        for (int32_t i = 0; i < n_input; i++) {
++            batch.add(output_tokens[i], i, 0, true);
++        }
++        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++            LOG_ERR("%s: failed to commit prompt (%d tokens)\n", __func__, n_input);
++        }
++        llama_set_causal_attn(ctx, false);
++    }
++
++    int32_t batch_start = 0;
++
++    // The reference sampler resolves every pending slot whose confidence clears a threshold
++    // (denoising_config: low_confidence @ 0.95), falling back to the single most confident
++    // slot, instead of transferring a fixed count per step. A 32-slot block then usually
++    // resolves in a handful of passes rather than `steps_per_block` of them.
++    const char * conf_env       = getenv("LLAMA_DIFFUSION_CONF_THRESHOLD");
++    const float  conf_threshold = conf_env ? (float) atof(conf_env) : 0.95f;
++
+     for (int block_num = 0; block_num < num_blocks; block_num++) {
+-        int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
+-        int32_t block_end   = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ?
+-                                  std::min(n_input + (block_num + 1) * params.block_length, params.max_length) :
+-                                  params.max_length;
+-
+-        // Count masked tokens in current block for block-based processing
+-        if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
+-            int32_t block_mask_count = 0;
+-            for (int i = block_start; i < block_end; i++) {
+-                if (output_tokens[i] == params.mask_token_id) {
+-                    block_mask_count++;
+-                }
++        const int32_t block_start = block_based ? n_input + block_num * params.block_length : 0;
++        const int32_t block_end   = block_based ? block_start + params.block_length : params.max_length;
++
++        if (block_based) {
++            for (int32_t i = block_start; i < block_end; i++) {
++                output_tokens[i] = params.mask_token_id;
+             }
+-            num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_per_block);
++            num_transfer_tokens = get_num_transfer_tokens(params.block_length, steps_per_block);
++            int32_t dbg_tsum = 0;
++            for (auto v : num_transfer_tokens) { dbg_tsum += v; }
++            LOG_DBG("block %d: range=[%d,%d) masks=%d steps=%d transfer_sum=%d\n",
++                    block_num, block_start, block_end, params.block_length, steps_per_block, dbg_tsum);
+         }
+ 
++
+         for (int32_t step = 0; step < steps_per_block; step++) {
+             int32_t global_step = block_num * steps_per_block + step;
+ 
+             if (params.step_callback) {
+                 if (!params.step_callback(
+-                        global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
++                        global_step, total_steps, output_tokens, params.max_length, params.step_callback_user_data)) {
+                     break;
+                 }
+             }
+ 
+-            // Setup batch
++            // Preview this block in the scratch sequence: reset it wholesale (the recurrent
++            // state has no partial erase), copy the committed prefix in, then denoise only
++            // the block's own positions.
++            batch_start = block_start;
++            llama_memory_seq_rm(mem, scratch_seq, -1, -1);
++            llama_memory_seq_cp(mem, 0, scratch_seq, -1, -1);
+             batch.clear();
+-            for (int32_t i = 0; i < params.max_length; i++) {
+-                batch.add(output_tokens[i], i, 0, true);
++            for (int32_t i = block_start; i < block_end; i++) {
++                batch.add(output_tokens[i], i, scratch_seq, true);
+             }
+ 
+             float * logits = nullptr;
+ 
+             if (params.cfg_scale > 0.0f) {
++                const int32_t n_rows       = block_end - block_start;
++                const size_t  block_floats = (size_t) n_rows * n_vocab;
+                 int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                 if (ret != 0) {
+                     LOG_ERR("Failed to generate conditional");
+                     break;
+                 }
+                 float * cond_logits_ptr = llama_get_logits(ctx);
+-                std::memcpy(cond_logits_buffer.data(), cond_logits_ptr, logits_size * sizeof(float));
++                std::memcpy(cond_logits_buffer.data(), cond_logits_ptr, block_floats * sizeof(float));
+ 
+                 // Unconditional generation (mask input)
+                 std::copy(output_tokens, output_tokens + params.max_length, un_x_buffer.begin());
+@@ -226,8 +276,10 @@ void diffusion_generate(llama_context *          ctx,
+                 }
+ 
+                 batch.clear();
+-                for (int32_t i = 0; i < params.max_length; i++) {
+-                    batch.add(un_x_buffer[i], i, 0, true);
++                llama_memory_seq_rm(mem, scratch_seq, -1, -1);
++                llama_memory_seq_cp(mem, 0, scratch_seq, -1, -1);
++                for (int32_t i = block_start; i < block_end; i++) {
++                    batch.add(un_x_buffer[i], i, scratch_seq, true);
+                 }
+                 ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                 if (ret != 0) {
+@@ -237,7 +289,7 @@ void diffusion_generate(llama_context *          ctx,
+                 float * uncond_logits = llama_get_logits(ctx);
+ 
+                 // Apply CFG
+-                for (int32_t i = 0; i < logits_size; i++) {
++                for (size_t i = 0; i < block_floats; i++) {
+                     cond_logits_buffer[i] =
+                         uncond_logits[i] + (params.cfg_scale + 1.0f) * (cond_logits_buffer[i] - uncond_logits[i]);
+                 }
+@@ -256,11 +308,18 @@ void diffusion_generate(llama_context *          ctx,
+                 break;
+             }
+ 
++            // The mask token is never a valid prediction, same as the reference sampler.
++            for (int32_t i = block_start; i < block_end; i++) {
++                logits[(i - block_start) * n_vocab + params.mask_token_id] = -INFINITY;
++            }
++
+             auto get_logits_for_pos = [&](int32_t pos) -> const float * {
++                // The batch holds only the current block, so logits row 0 is batch_start.
++                const int32_t row = pos - batch_start;
+                 if (params.shift_logits) {
+-                    return pos == 0 ? logits : logits + (pos - 1) * n_vocab;
++                    return row == 0 ? logits : logits + (row - 1) * n_vocab;
+                 }
+-                return logits + pos * n_vocab;
++                return logits + row * n_vocab;
+             };
+ 
+             int64_t time_start_sampling = ggml_time_us();
+@@ -338,8 +397,17 @@ void diffusion_generate(llama_context *          ctx,
+                     confidences.emplace_back(conf, i);
+                 }
+ 
+-                int32_t transfer_count = calculate_transfer_count(
+-                    step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
++                int32_t transfer_count = 0;
++                if (block_based) {
++                    int32_t n_conf = 0;
++                    for (const auto & c : confidences) {
++                        n_conf += c.first > conf_threshold;
++                    }
++                    transfer_count = std::max(1, n_conf);
++                } else {
++                    transfer_count = calculate_transfer_count(
++                        step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
++                }
+ 
+                 if (transfer_count > 0) {
+                     if (params.alg_temp == 0.0f) {
+@@ -389,6 +457,24 @@ void diffusion_generate(llama_context *          ctx,
+             int64_t time_end_sampling = ggml_time_us();
+             total_sampling_time += time_end_sampling - time_start_sampling;
+         }
++
++        // Commit the resolved block: replay it through the causal path so the recurrent and
++        // attention state for seq 0 matches the text, then the next block previews against
++        // that state. The preview copy in scratch is discarded.
++        if (block_based) {
++            llama_set_causal_attn(ctx, true);
++            llama_memory_seq_rm(mem, scratch_seq, -1, -1);
++            llama_memory_seq_cp(mem, 0, scratch_seq, -1, -1);
++            batch.clear();
++            for (int32_t i = block_start; i < block_end; i++) {
++                batch.add(output_tokens[i], i, scratch_seq, true);
++            }
++            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++                LOG_ERR("%s: failed to commit block %d\n", __func__, block_num);
++            }
++            llama_memory_seq_cp(mem, scratch_seq, 0, -1, -1);
++            llama_set_causal_attn(ctx, false);
++        }
+     }
+ 
+     int64_t time_end = ggml_time_us();
+-- 
+2.43.0
+

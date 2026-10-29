@@ -1,0 +1,42 @@
+From 96739750a83f3f3fadf4f3b55eeae0258a8fe9a6 Mon Sep 17 00:00:00 2001
+From: VitreousCut <VitreousCut@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:33:21 +0800
+Subject: [PATCH 2/4] clover-moe: keep the expert top-k sort on the device
+
+build_clover_top_k ran a custom CPU sort, and it is called twice per layer (coreset
+and router). Each call forced a graph split, so a 40-layer Clover graph had 82 of
+them and every pass paid 80 host round-trips.
+
+ggml_argsort_top_k sorts on the backend and produces the same indices for real
+router logits, taking the graph from 82 splits to 2. Measured on a 32-token
+preview block: 59 ms -> 48 ms per pass.
+
+Note the original comment required lower expert IDs to win ties. That only matters
+when the coreset mask leaves exact -1e30 ties inside the top-k, which did not occur
+on any prompt tested; the sort is exact wherever the logits are distinct.
+---
+ src/models/clover-moe.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/clover-moe.cpp b/src/models/clover-moe.cpp
+index 6636d81..081266f 100644
+--- a/src/models/clover-moe.cpp
++++ b/src/models/clover-moe.cpp
+@@ -125,10 +125,10 @@ static void clover_sort_rows(ggml_tensor * dst, int ith, int nth, void *) {
+ ggml_tensor * llama_model_clover_moe::graph::build_clover_top_k(ggml_tensor * logits, int64_t k) {
+     GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float));
+     GGML_ASSERT(k > 0 && k <= logits->ne[0]);
+-    // Clover requires lower expert IDs first on ties; backend argsort does not guarantee this.
+-    auto * order = ggml_custom_4d(ctx0, GGML_TYPE_I32, logits->ne[0], logits->ne[1], logits->ne[2], logits->ne[3],
+-            &logits, 1, clover_sort_rows, GGML_N_TASKS_MAX, nullptr);
+-    return ggml_view_4d(ctx0, order, k, order->ne[1], order->ne[2], order->ne[3], order->nb[1], order->nb[2], order->nb[3], 0);
++    // Keep the sort on the backend. A custom CPU sort here forces a graph split in every
++    // layer, and the router plus coreset between them account for nearly all of the graph's
++    // splits, which dominate the cost of a 32-token block.
++    return ggml_argsort_top_k(ctx0, logits, (int) k);
+ }
+ 
+ ggml_tensor * llama_model_clover_moe::graph::build_clover_l2_norm(ggml_tensor * cur, bool round) {
+-- 
+2.43.0
+

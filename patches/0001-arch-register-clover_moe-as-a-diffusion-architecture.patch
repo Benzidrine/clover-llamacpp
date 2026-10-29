@@ -1,0 +1,28 @@
+From 5d00a9f334da8ba4b3f797b81dd7e4a08c7e1392 Mon Sep 17 00:00:00 2001
+From: VitreousCut <VitreousCut@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:33:11 +0800
+Subject: [PATCH 1/4] arch: register clover_moe as a diffusion architecture
+
+PR #31306 adds the clover_moe architecture, its GGUF metadata and its graph,
+but llm_arch_is_diffusion() was never updated. Loading a Clover GGUF then
+succeeds through all 21 GB of weights before failing with "unsupported model
+for diffusion", which points at the loader rather than at the missing case.
+---
+ src/llama-arch.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 8946c07..4d932c5 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1286,6 +1286,7 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
+         case LLM_ARCH_LLADA:
+         case LLM_ARCH_LLADA_MOE:
+         case LLM_ARCH_RND1:
++        case LLM_ARCH_CLOVER_MOE: // block-diffusion MoE (PR #31306 added the arch but not this case)
+             return true;
+         default:
+             return false;
+-- 
+2.43.0
+
